@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Route A · GET 通信诊断</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#071421;color:#e6f2fa;font:16px/1.6 system-ui,-apple-system,sans-serif}main{max-width:820px;margin:auto;padding:24px 18px 48px}h1{font-size:27px;margin:0 0 12px}h2{font-size:19px;margin:0 0 12px}section{background:#102638;border:1px solid #29485e;border-radius:16px;padding:18px;margin:16px 0}p{margin:10px 0}.muted{color:#a1b8c8}.notice{color:#8eead9}label{display:block;margin:12px 0}input,button,textarea{font:inherit;border-radius:10px;border:1px solid #35556c;padding:11px;background:#091c2b;color:inherit}input{width:100%;margin-top:6px}button{cursor:pointer;background:#175d66;margin:5px 5px 5px 0}button:disabled{opacity:.4;cursor:default}.secondary{background:#213b4e}textarea{width:100%;height:330px;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre;overflow:auto}pre{margin:10px 0;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 ui-monospace,Consolas,monospace}#result{font-weight:600;overflow-wrap:anywhere}.steps{padding-left:22px}.steps li{margin:6px 0}
+</style>
+</head>
+<body>
+<main>
+<p class="notice">ROUTE A · GET 通信诊断 v1</p>
+<h1>检查手机 → 小车的命令通路</h1>
+<p>本页的诊断按钮仅发送 GET 读取命令。保留收到的遥测，等待 PID 回包；超时后保持连接，便于查看日志。</p>
+<ol class="steps">
+<li>把本文件放到原网页所在的 HTTPS 站点，在 iPhone Bluefy 中打开。</li>
+<li>连接小车，先测试“GET · 旧接口”。收到 PID 回包就保存日志。</li>
+<li>若未收到 PID，断开并重新连接，再测试下一种写入方式。每次连接只测试一种，避免迟到回包混淆结果。</li>
+</ol>
+<section>
+<h2>连接</h2>
+<label>设备名称前缀（可留空）<input id="prefix" value="YahBoom_BL" autocomplete="off"></label>
+<button id="connect">连接小车</button><button id="disconnect" class="secondary" disabled>断开连接</button>
+<p id="link">未连接</p>
+<pre id="properties">连接后显示 FFE1 属性和可用写入方法。</pre>
+</section>
+<section>
+<h2>读取 PID</h2>
+<button id="legacy" disabled>GET · 旧接口</button>
+<button id="withResponse" disabled>GET · 有响应写入</button>
+<button id="withoutResponse" disabled>GET · 无响应写入</button>
+<p class="muted">每个按钮发送相同的 $P1,GET,CD032#；每次连接仅发送一次。</p>
+<p id="result">等待连接后测试。</p>
+<pre id="telemetry">尚未收到遥测。</pre>
+</section>
+<section>
+<h2>诊断日志</h2>
+<p class="muted">包含实际写入方法、接口完成/错误、通知原始字节、CRC 校验和 PID 结果。</p>
+<button id="copy" class="secondary">复制日志</button><button id="export" class="secondary">下载日志</button>
+<textarea id="log" aria-label="诊断日志" readonly></textarea>
+</section>
+</main>
+<script>
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === "object" && module.exports) module.exports = api;
+  root.RouteACore = api;
+})(typeof globalThis !== "undefined" ? globalThis : this, function () {
+  "use strict";
+
+  const DEFAULT_PID = Object.freeze({ AP: 96, AD: 48, VP: 62, VI: 31, TP: 17, TD: 20 });
+  const PID_KEYS = Object.freeze(["AP", "AD", "VP", "VI", "TP", "TD"]);
+  const RANGES = Object.freeze({ AP: [20,288], AD: [5,200], VP: [10,72], VI: [1,100], TP: [1,100], TD: [1,100] });
+
+  function crc16(text) {
+    const bytes = new TextEncoder().encode(text);
+    let crc = 0xffff;
+    for (const byte of bytes) {
+      crc ^= byte << 8;
+      for (let i = 0; i < 8; i += 1) {
+        crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff;
+      }
+    }
+    return crc;
+  }
+
+  function frame(body) {
+    if (typeof body !== "string" || /[$#\r\n]/.test(body)) throw new Error("报文正文无效");
+    return `$${body},C${crc16(body).toString(16).toUpperCase().padStart(4, "0")}#`;
+  }
+
+  function verify(raw) {
+    if (typeof raw !== "string" || raw[0] !== "$" || !raw.endsWith("#")) return false;
+    const p = raw.lastIndexOf(",C");
+    if (p < 0 || raw.length - p !== 7) return false;
+    if (!/^[0-9a-f]{4}$/i.test(raw.slice(p + 2, p + 6))) return false;
+    const expected = Number.parseInt(raw.slice(p + 2, p + 6), 16);
+    return Number.isFinite(expected) && expected === crc16(raw.slice(1, p));
+  }
+
+  class StreamParser {
+    constructor(max = 256) { this.max = max; this.buffer = ""; }
+    feed(input) {
+      const text = typeof input === "string" ? input : new TextDecoder("ascii").decode(input);
+      const out = [];
+      for (const ch of text) {
+        if (ch === "$") this.buffer = "$";
+        else if (this.buffer) {
+          this.buffer += ch;
+          if (this.buffer.length > this.max) this.buffer = "";
+          else if (ch === "#") { out.push(this.buffer); this.buffer = ""; }
+        }
+      }
+      return out;
+    }
+  }
+
+  function finiteNumber(value, name) {
+    if (value === null || value === undefined || typeof value === "boolean" || (typeof value === "string" && !value.trim())) throw new Error(`${name} 不能为空`);
+    const n = Number(value);
+    if (!Number.isFinite(n)) throw new Error(`${name} 必须是有限数字`);
+    return n;
+  }
+
+  function normalizePid(input) {
+    if (!input || typeof input !== "object") throw new Error("PID 必须是对象");
+    const p = {};
+    for (const key of PID_KEYS) p[key] = finiteNumber(input[key], key);
+    return p;
+  }
+
+  function pidCsv(pid) {
+    const p = normalizePid(pid);
+    return PID_KEYS.map((key) => p[key].toFixed(2)).join(",");
+  }
+
+  function boundedPid(input) {
+    const p = normalizePid(input);
+    for (const k of PID_KEYS) {
+      p[k] = Math.round(p[k] * 100) / 100;
+      if (p[k] < RANGES[k][0] || p[k] > RANGES[k][1]) throw new Error(`${k} 超出保护范围 ${RANGES[k].join("..")}`);
+    }
+    return p;
+  }
+  function samePid(a,b) { return !!a && !!b && PID_KEYS.every(k => Math.abs(a[k]-b[k]) < .005); }
+  function parseAck(raw) {
+    const x = bodyParts(raw);
+    if (!x || x[0] !== "P1") return null;
+    if (x[1] === "ERR") return { type: "ERR", code: x.slice(2).join(",") };
+    if (x[1] !== "ACK" || x.length < 4 || !/^\d+$/.test(x[3])) return null;
+    return { type: "ACK", name: x[2], id: Number(x[3]), fields: x.slice(4) };
+  }
+  function endpoint(base) {
+    const url = new URL(base, typeof location !== "undefined" ? location.href : "http://localhost");
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost","127.0.0.1","[::1]"].includes(url.hostname))) throw new Error("LLM 地址必须使用 HTTPS（本机 localhost 除外）");
+    if (url.username || url.password || url.search || url.hash) throw new Error("接口地址不能包含账号、查询参数或片段");
+    const path = url.pathname.replace(/\/+$/, "");
+    url.pathname = path.endsWith("/chat/completions") ? path : path + "/chat/completions";
+    return url.href;
+  }
+
+  function command(name, id) { return frame(`P1,${name},${Math.trunc(id)}`); }
+  function getPid() { return frame("P1,GET"); }
+  function training(action) { return frame(`P1,TRAIN,${action}`); }
+  function manualSet(pid) { return frame(`P1,MSET,${pidCsv(pid)}`); }
+  function prepare(id, ttl, pid) { return frame(`P1,PREP,${Math.trunc(id)},${Math.trunc(ttl)},${pidCsv(pid)}`); }
+  function motorDiag(action) { return frame(`P1,DIAG,${action}`); }
+
+  function legacyMotion(move, pivot) {
+    if (!Number.isInteger(move) || move < 0 || move > 4 || !Number.isInteger(pivot) || pivot < 0 || pivot > 2) throw new Error("移动字段无效");
+    // Official 21-byte movement-only frame: PID-operation and all update flags remain zero.
+    return `$${move},${pivot},0,0,0,0,0,0,0,0#`;
+  }
+
+  function bodyParts(raw) {
+    if (!verify(raw)) return null;
+    return raw.slice(1, raw.lastIndexOf(",C")).split(",");
+  }
+
+  function parsePidStatus(raw) {
+    const x = bodyParts(raw);
+    if (!x || x.length !== 11 || x[0] !== "P1" || x[1] !== "PID" || !/^[012]$/.test(x[8]) || !/^[01]$/.test(x[9]) || !/^[01]$/.test(x[10])) return null;
+    try {
+      return {
+        pid: normalizePid({ AP: x[2], AD: x[3], VP: x[4], VI: x[5], TP: x[6], TD: x[7] }),
+        state: Number.parseInt(x[8], 10), trainingLocked: x[9] === "1", balanceStarted: x[10] === "1"
+      };
+    } catch (_) { return null; }
+  }
+
+  function parseFast(raw) {
+    const x = bodyParts(raw);
+    if (!x || x.length !== 16 || x[0] !== "T1" || x[1] !== "F" || !/^S[012]$/.test(x[9]) || !/^L[01]$/.test(x[10]) || !/^R[01]$/.test(x[11])) return null;
+    const n = (i, prefix) => { if (!x[i].startsWith(prefix)) throw new Error("字段前缀错误"); return finiteNumber(x[i].slice(prefix.length), prefix); };
+    try {
+      return {
+        ms: n(2, ""), angle: n(3, "A"), gyro: n(4, "G"), el: n(5, "EL"), er: n(6, "ER"),
+        ml: n(7, "ML"), mr: n(8, "MR"), state: n(9, "S"),
+        trainingLocked: x[10]?.slice(1) === "1", balanceStarted: x[11]?.slice(1) === "1",
+        c1: x[12] ? n(12, "C1") : 0, c2: x[13] ? n(13, "C2") : 0,
+        c3: x[14] ? n(14, "C3") : 0, c4: x[15] ? n(15, "C4") : 0
+      };
+    } catch (_) { return null; }
+  }
+
+  function parseSlow(raw) {
+    const x = bodyParts(raw);
+    if (!x || x.length !== 17 || x[0] !== "T1" || x[1] !== "S" || !/^L[01]$/.test(x[14]) || !/^R[01]$/.test(x[15])) return null;
+    const n = (i, prefix) => { if (!x[i].startsWith(prefix)) throw new Error("字段前缀错误"); return finiteNumber(x[i].slice(prefix.length), prefix); };
+    try {
+      return {
+        ms: n(2, ""), battery: n(3, "V"), balancePwm: n(4, "B"), velocityPwm: n(5, "V"), turnPwm: n(6, "T"),
+        pid: normalizePid({ AP: n(7, "AP"), AD: n(8, "AD"), VP: n(9, "VP"), VI: n(10, "VI"), TP: n(11, "TP"), TD: n(12, "TD") }),
+        dropped: n(13, "D"), trainingLocked: x[14].slice(1) === "1", balanceStarted: x[15].slice(1) === "1", firmware: x[16]
+      };
+    } catch (_) { return null; }
+  }
+
+  function metrics(samples) {
+    if (!Array.isArray(samples) || samples.length === 0) throw new Error("没有可用遥测样本");
+    const sumAngle = samples.reduce((s, x) => s + x.angle * x.angle, 0);
+    const sumGyro = samples.reduce((s, x) => s + x.gyro * x.gyro, 0);
+    const stamps = samples.map(x=>x.at).filter(Number.isFinite);
+    const gaps = stamps.slice(1).map((t,i)=>t-stamps[i]);
+    return {
+      rmsAngle: Math.sqrt(sumAngle / samples.length),
+      peakAngle: Math.max(...samples.map((x) => Math.abs(x.angle))),
+      rmsGyro: Math.sqrt(sumGyro / samples.length),
+      saturationRate: samples.filter((x) => Math.abs(x.ml) >= 2595 || Math.abs(x.mr) >= 2595).length / samples.length,
+      samples: samples.length,
+      durationMs: stamps.length > 1 ? stamps[stamps.length-1]-stamps[0] : 0,
+      maxGapMs: gaps.length ? Math.max(...gaps) : 0
+    };
+  }
+
+  function harness(base, m) {
+    const p = normalizePid(base);
+    if (m.peakAngle > 8) p.AP *= 1.04;
+    if (m.rmsGyro > 20) p.AD *= 1.04;
+    return { schema_version: 1, decision: samePid(p,base) ? "hold" : "propose", stage: "balance", candidate: p, expected_effect: "本地确定性规则建议；仅作流程测试，不代表参数已优化。", requested_test: "quiet_balance", confidence: 0.7 };
+  }
+
+  function validateProposal(raw, base, maxPct = 5) {
+    const p = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!p || typeof p !== "object" || Array.isArray(p)) throw new Error("LLM JSON 必须是对象");
+    p.candidate = p.candidate && { ...p.candidate };
+    if (!Number.isFinite(maxPct) || maxPct < .1 || maxPct > 5) throw new Error("最大变化必须在 0.1..5% 之间");
+    const exact = ["schema_version", "decision", "stage", "candidate", "expected_effect", "requested_test", "confidence"];
+    if (Object.keys(p).sort().join() !== exact.sort().join()) throw new Error("LLM JSON 字段不符合固定 schema");
+    if (p.schema_version !== 1 || !["propose", "hold", "rollback"].includes(p.decision) || p.stage !== "balance") throw new Error("LLM 决策或阶段无效");
+    if (!["balance_recovery", "quiet_balance"].includes(p.requested_test)) throw new Error("requested_test 无效");
+    if (typeof p.expected_effect !== "string" || !p.expected_effect.trim() || p.expected_effect.length > 500) throw new Error("expected_effect 无效");
+    if (typeof p.confidence !== "number") throw new Error("confidence 必须是数字");
+    if (p.confidence < 0 || p.confidence > 1) throw new Error("confidence 超出 0..1");
+    const b = boundedPid(base);
+    if (!p.candidate || PID_KEYS.some(k=>typeof p.candidate[k] !== "number")) throw new Error("candidate 六个 PID 必须是数字");
+    const c = boundedPid(p.candidate);
+    if (Object.keys(p.candidate).sort().join() !== PID_KEYS.slice().sort().join()) throw new Error("candidate 必须恰好包含六个 PID");
+    for (const key of ["VP", "VI", "TP", "TD"]) if (Math.abs(c[key] - b[key]) >= 0.005) throw new Error(`${key} 在 balance 阶段不得变化`);
+    for (const key of ["AP", "AD"]) {
+      const pct = Math.abs(c[key] - b[key]) * 100 / Math.abs(b[key]);
+      if (!Number.isFinite(pct) || pct > Math.min(5, maxPct) + 1e-9) throw new Error(`${key} 变化 ${pct.toFixed(2)}% 超过限制`);
+    }
+    if (p.decision !== "propose" && !samePid(c,b)) throw new Error("hold / rollback 必须返回当前 PID");
+    p.candidate = c;
+    return p;
+  }
+
+  return { DEFAULT_PID, PID_KEYS, RANGES, crc16, frame, verify, StreamParser, normalizePid, boundedPid, samePid, parseAck, endpoint, pidCsv, command, getPid, training, manualSet, prepare, motorDiag, legacyMotion, parsePidStatus, parseFast, parseSlow, metrics, harness, validateProposal };
+});
+
+
+</script>
+<script>
+(function () {
+  'use strict';
+  const C=window.RouteACore, $=id=>document.getElementById(id);
+  const methods={legacy:'writeValue',withResponse:'writeValueWithResponse',withoutResponse:'writeValueWithoutResponse'};
+  const service='0000ffe0-0000-1000-8000-00805f9b34fb', characteristic='0000ffe1-0000-1000-8000-00805f9b34fb';
+  const S={epoch:0,device:null,ch:null,notify:null,onDisconnect:null,connecting:false,connected:false,used:false,busy:false,probe:null,parser:new C.StreamParser(512),logs:[],fast:0,slow:0,pid:0,bad:0,lastSlow:null};
+  function log(kind,value){S.logs.push(new Date().toISOString()+' '+kind+' '+value);if(S.logs.length>1500)S.logs.shift();$('log').value=S.logs.join('\n');$('log').scrollTop=$('log').scrollHeight;}
+  function update(){ $('connect').disabled=S.connected||S.connecting;$('disconnect').disabled=!S.connected&&!S.connecting;for(const [id,method]of Object.entries(methods))$(id).disabled=!S.connected||S.used||S.busy||typeof S.ch?.[method]!=='function'; }
+  function summary(){const x=S.lastSlow;$('telemetry').textContent=`有效快遥测 ${S.fast} 帧 / 慢遥测 ${S.slow} 帧 / PID ${S.pid} 帧 / 无效帧 ${S.bad}\n`+(x?`固件 ${x.firmware} / 电池 ${x.battery.toFixed(2)} V\nPID ${C.pidCsv(x.pid)} / 训练锁 ${x.trainingLocked?1:0} / 平衡 ${x.balanceStarted?1:0}`:'等待有效慢遥测。');}
+  function stopProbe(reason){const p=S.probe;if(p){clearTimeout(p.timer);S.probe=null;p.reject(Error(reason));}}
+  function close(reason,requestDisconnect=true){const d=S.device;S.epoch++;stopProbe(reason);S.ch?.removeEventListener('characteristicvaluechanged',S.notify);d?.removeEventListener('gattserverdisconnected',S.onDisconnect);S.device=null;S.ch=null;S.notify=null;S.onDisconnect=null;S.connected=false;S.connecting=false;S.busy=false;S.used=false;if(requestDisconnect&&d?.gatt?.connected)d.gatt.disconnect();$('link').textContent=reason;log('SYS',reason);update();}
+  function notification(event,epoch){if(epoch!==S.epoch||!S.connected)return;try{const v=event.target.value,bytes=new Uint8Array(v.buffer,v.byteOffset,v.byteLength);log('RX_BYTES',Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join(' ')+' | '+JSON.stringify(new TextDecoder('ascii').decode(bytes)));for(const raw of S.parser.feed(bytes)){log('RX',raw);if(!C.verify(raw)){S.bad++;log('PARSE','CRC 无效');continue;}const pid=C.parsePidStatus(raw),fast=C.parseFast(raw),slow=C.parseSlow(raw),ack=C.parseAck(raw);if(pid){S.pid++;log('PID',JSON.stringify(pid));if(S.probe){const p=S.probe;clearTimeout(p.timer);S.probe=null;p.resolve(pid);}}else if(fast)S.fast++;else if(slow){S.slow++;S.lastSlow=slow;}else if(ack?.type==='ERR'){log('FIRMWARE_ERR',ack.code);stopProbe('固件返回错误：'+ack.code);}else log('PARSE','CRC 有效，非 PID/遥测回包');}summary();}catch(e){log('RX_ERROR',e.message);}}
+  async function connect(){if(S.connected||S.connecting)return;let device;const epoch=++S.epoch;S.connecting=true;update();try{if(!navigator.bluetooth)throw Error('没有 Web Bluetooth；请在 iPhone Bluefy 中打开 HTTPS 页面');if(!window.isSecureContext)throw Error('需要 HTTPS 安全上下文');const prefix=$('prefix').value.trim();device=await navigator.bluetooth.requestDevice({...(prefix?{filters:[{namePrefix:prefix},{namePrefix:' Yah'}]}:{acceptAllDevices:true}),optionalServices:[service]});if(epoch!==S.epoch){if(device.gatt.connected)device.gatt.disconnect();return;}S.device=device;S.onDisconnect=()=>close('设备连接已断开',false);device.addEventListener('gattserverdisconnected',S.onDisconnect);const server=await device.gatt.connect();if(epoch!==S.epoch){device.gatt.disconnect();return;}const svc=await server.getPrimaryService(service);if(epoch!==S.epoch)return;const ch=await svc.getCharacteristic(characteristic);if(epoch!==S.epoch)return;S.ch=ch;S.parser=new C.StreamParser(512);S.fast=0;S.slow=0;S.pid=0;S.bad=0;S.lastSlow=null;S.used=false;S.notify=e=>notification(e,epoch);ch.addEventListener('characteristicvaluechanged',S.notify);await ch.startNotifications();if(epoch!==S.epoch){ch.removeEventListener('characteristicvaluechanged',S.notify);return;}S.connected=true;S.connecting=false;const p=ch.properties||{},props=Object.fromEntries(['read','write','writeWithoutResponse','notify','indicate'].map(k=>[k,p[k]??null]));const available=Object.fromEntries(Object.values(methods).map(k=>[k,typeof ch[k]==='function']));$('properties').textContent=JSON.stringify({service,characteristic,properties:props,methods:available},null,2);log('GATT',JSON.stringify({name:device.name,properties:props,methods:available,userAgent:navigator.userAgent}));$('link').textContent='GATT 已连接，等待 GET 测试';$('result').textContent='先测试 GET · 旧接口。';summary();update();}catch(e){if(epoch===S.epoch){close('连接失败：'+e.message);$('result').textContent=e.message;}}}
+  function pidWait(epoch){let probe;const promise=new Promise((resolve,reject)=>{probe={resolve,reject,timer:setTimeout(()=>{if(S.probe!==probe)return;S.probe=null;reject(Error('6 秒内未收到有效 P1,PID 回包'));},6000)};S.probe=probe;});promise.catch(()=>{});return {promise,epoch};}
+  async function get(method){if(!S.connected||S.used||S.busy)return;const epoch=S.epoch,ch=S.ch;if(typeof ch?.[method]!=='function')return;S.used=true;S.busy=true;update();const pending=pidWait(epoch);$('result').textContent='正在通过 '+method+' 读取 PID…';let writeFinished=false,writeTimer;const bytes=new TextEncoder().encode(C.getPid());log('TX_ATTEMPT',JSON.stringify({method,text:C.getPid(),hex:Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join(' '),length:bytes.length}));try{const writing=Promise.resolve().then(()=>ch[method](bytes)).then(()=>{writeFinished=true;if(epoch===S.epoch)log('WRITE_DONE',method+' 接口已完成；等待固件 PID 回包');});const deadline=new Promise((_,reject)=>{writeTimer=setTimeout(()=>reject(Error('写入接口 5 秒未返回；请断开重连后测试下一种方式')),5000);});await Promise.race([writing,deadline]);clearTimeout(writeTimer);const pid=await pending.promise;if(epoch!==S.epoch)return;$('result').textContent='已确认 GET → PID 双向通信：'+method;log('RESULT',JSON.stringify({method,writeFinished,pid}));}catch(e){clearTimeout(writeTimer);stopProbe('测试结束');if(epoch!==S.epoch)return;$('result').textContent=e.message+'。已保留连接与遥测；保存日志后断开重连。';log('RESULT',JSON.stringify({method,writeFinished,pidReceived:S.pid>0,error:e.message,fast:S.fast,slow:S.slow}));}finally{if(epoch===S.epoch){S.busy=false;update();}}}
+  $('connect').addEventListener('click',connect);$('disconnect').addEventListener('click',()=>{close('已手动断开');$('result').textContent='可以重新连接，测试另一种写入方式。';});
+  for(const [id,method]of Object.entries(methods))$(id).addEventListener('click',()=>get(method));
+  $('copy').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(S.logs.join('\n'));$('result').textContent='日志已复制。';}catch(e){$('log').focus();$('log').select();$('result').textContent='已选中日志，请使用手机的复制功能。';}});
+  $('export').addEventListener('click',()=>{const blob=new Blob([S.logs.join('\n')],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='routea-get-diagnostic-'+new Date().toISOString().replace(/[:.]/g,'-')+'.txt';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);});
+  log('SYS','Route A GET 诊断 v1；按钮仅发送 GET；每次连接测试一种写入方式');update();
+})();
+
+</script>
+</body>
+</html>
